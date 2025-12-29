@@ -93,7 +93,7 @@ az aks create \
 Get cluster credentials:
 
 ```bash
-az aks get-credentials --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME --admin
+az aks get-credentials --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME --admin --overwrite-existing
 ```
 
 Verify cluster access:
@@ -109,7 +109,7 @@ Create a PostgreSQL Flexible Server:
 ```bash
 export POSTGRES_SERVER="mattermost-postgres"
 export POSTGRES_ADMIN_USER="mmadmin"
-export POSTGRES_ADMIN_PASSWORD="$(openssl rand -base64 32)"
+export POSTGRES_ADMIN_PASSWORD="$(openssl rand -base64 32 | tr -d '+/=' | head -c 32)"
 
 echo "PostgreSQL Admin Password: $POSTGRES_ADMIN_PASSWORD"  # Save this!
 
@@ -143,7 +143,7 @@ kubectl create namespace mattermost
 
 Create the PostgreSQL secret:
 
-Edit [mattermost-postgres-secret.yaml](mattermost-postgres-secret.yaml) and replace the placeholders:
+Edit [mattermost-secret-postgres.yaml](mattermost-secret-postgres.yaml) and replace the placeholders:
 - `YOUR_POSTGRES_USER` with `$POSTGRES_ADMIN_USER` (e.g., `mmadmin`)
 - `YOUR_POSTGRES_PASSWORD` with `$POSTGRES_ADMIN_PASSWORD`
 - `YOUR_POSTGRES_SERVER` with `$POSTGRES_SERVER` (e.g., `mattermost-postgres`)
@@ -156,7 +156,7 @@ postgres://mmadmin:YOUR_PASSWORD@mattermost-postgres.postgres.database.azure.com
 Apply the secret:
 
 ```bash
-kubectl apply -f mattermost-postgres-secret.yaml
+kubectl apply -f mattermost-secret-postgres.yaml
 ```
 
 Verify the secret was created:
@@ -340,8 +340,6 @@ Edit [mattermost-gateway.yaml](mattermost-gateway.yaml) and replace `YOUR_ALB_ID
 kubectl apply -f mattermost-gateway.yaml
 ```
 
-**Note:** The Gateway will initially only have an HTTP listener. We'll add HTTPS after the TLS certificate is issued.
-
 Wait for Gateway to get an external IP:
 
 ```bash
@@ -350,10 +348,12 @@ kubectl wait --for=condition=Programmed gateway mattermost-gateway -n mattermost
 GATEWAY_FQDN=$(kubectl get gateway mattermost-gateway -n mattermost -o jsonpath='{.status.addresses[0].value}')
 GATEWAY_IP=$(dig +short "$GATEWAY_FQDN" | head -1)
 
+echo "Gateway FQDN: $GATEWAY_FQDN"
 echo "Gateway IP: $GATEWAY_IP"
+echo "Add a DNS record for your Mattermost domain."
 ```
 
-**IMPORTANT:** Update your DNS to point your domain to the Gateway IP before continuing.
+**IMPORTANT:** Update your DNS to point your domain to the Gateway IP (A record) or FQDN (CNAME record) before continuing.
 
 ### 9. Install MinIO Operator
 
@@ -403,10 +403,10 @@ kubectl wait --for=jsonpath='{.status.currentState}'=Initialized \
 
 ### 11. Configure MinIO Bucket
 
-Port-forward to MinIO:
+Port-forward to MinIO (run in background):
 
 ```bash
-kubectl port-forward svc/minio -n mattermost-minio 9000:80
+kubectl port-forward svc/minio -n mattermost-minio 9000:80 &
 ```
 
 Configure mc client:
@@ -487,9 +487,9 @@ Clean up ACME HTTPRoute:
 kubectl delete httproute acme-challenge -n mattermost
 ```
 
-### 13. Add HTTPS to Gateway
+Add HTTPS listener to Gateway:
 
-Edit [mattermost-gateway.yaml](mattermost-gateway.yaml) and add the HTTPS listener to the `listeners` array:
+Edit [mattermost-gateway.yaml](mattermost-gateway.yaml) and add the HTTPS listener section:
 
 ```yaml
   - name: https-listener
@@ -511,7 +511,7 @@ Apply the updated Gateway:
 kubectl apply -f mattermost-gateway.yaml
 ```
 
-### 14. Install Mattermost Operator
+### 13. Install Mattermost Operator
 
 Add the Mattermost Helm repository:
 
@@ -539,7 +539,7 @@ kubectl wait --for=condition=ready pod \
   -n mattermost-operator --timeout=300s
 ```
 
-### 15. Deploy Mattermost
+### 14. Deploy Mattermost
 
 Create a ClusterIP service for Gateway routing:
 
@@ -583,7 +583,7 @@ kubectl wait --for=condition=ready pod \
   -n mattermost --timeout=600s
 ```
 
-### 16. Verify Deployment
+### 15. Verify Deployment
 
 Check Mattermost status:
 

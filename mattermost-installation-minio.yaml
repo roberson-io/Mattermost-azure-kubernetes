@@ -4,7 +4,7 @@ metadata:
   name: mattermost
   namespace: mattermost
 spec:
-  size: 100users
+  size: 1000users
   ingress:
     enabled: true
     host: YOUR_DOMAIN
