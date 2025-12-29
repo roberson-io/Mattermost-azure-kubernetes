@@ -1,585 +1,672 @@
-# Mattermost Kubernetes Azure setup
+# Mattermost on Azure Kubernetes Service (AKS)
 
-This guide shows you how to setup Mattermost deployed via Kubernetes and all the necessary resources.
+This guide shows you how to deploy Mattermost on Azure Kubernetes Service with Gateway API for ingress and MinIO for file storage.
 
-This guide **does not** show you how to properly lock down your Azure tenant.
+This guide **does not** show you how to properly lock down your Azure tenant or configure production-grade security settings.
 
-## Prereqs
+## Prerequisites
 
-- Have an Azure account
-- Have a domain name that can be used.
-- Have `helm` installed on the device you will be running `kubectl` from.
+### Required Tools
 
-    **for MacOS**
+- **Azure Account** with sufficient quota for AKS cluster
+- **Domain Name** that you can configure DNS for
+- **kubectl** - Kubernetes command-line tool
+- **Azure CLI** - For managing Azure resources
+- **helm** - Kubernetes package manager
+- **mc** - MinIO client for bucket configuration
 
-    ```bash
-    brew install helm
-    ```
+### Installing Tools
 
-- Have `yq` installed
+**macOS:**
 
-    **for MacOS**
+```bash
+# Install Azure CLI
+brew update && brew install azure-cli
 
-    ```bash
-    brew install yq
-    ```
+# Install kubectl
+brew install kubectl
 
-- Have the minio kube plugin installed
+# Install helm
+brew install helm
 
-    Docs: https://min.io/docs/minio/kubernetes/upstream/reference/kubectl-minio-plugin.html#id2
+# Install MinIO client
+brew install minio/stable/mc
+```
 
-    ```bash
-    brew install krew
-    ```
+**Linux/Windows:**
+- Azure CLI: https://learn.microsoft.com/en-us/cli/azure/install-azure-cli
+- kubectl: https://kubernetes.io/docs/tasks/tools/
+- helm: https://helm.sh/docs/intro/install/
+- mc: https://min.io/docs/minio/linux/reference/minio-mc.html
 
-- Have `mc` installed
+## Deployment Steps
 
-    Docs: https://min.io/docs/minio/linux/reference/minio-mc.html?ref=docs
+### 1. Azure CLI Authentication
 
-    **macos**
+Authenticate the Azure CLI (this will open a browser window):
 
-    ```bash
-    brew install minio/stable/mc
-    ```
+```bash
+az login
+```
 
-## Setup
+If you need a specific tenant:
 
-### Create AWS initial Services
+```bash
+az login --tenant yourTenant.com
+```
 
-1. Download the azure CLI for your OS
+### 2. Create Resource Group
 
-    - [install azure cli](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
+Choose a resource group name and location:
 
-    **macOS:**
+```bash
+export RESOURCE_GROUP="mattermost-rg"
+export LOCATION="eastus2"
 
-    ```bash
-    brew update && brew install azure-cli
-    ```
-  
-2. Authenticate the CLI
+az group create --name $RESOURCE_GROUP --location $LOCATION
+```
 
-    This will open a new window to log into your Microsoft account.
+### 3. Create AKS Cluster
 
-    ```bash
-    az login
-    ```
+Create an AKS cluster with Azure CNI networking:
 
-    If you need a specific tenant you can do the below:
+```bash
+export CLUSTER_NAME="mattermost-aks"
 
-    ```bash
-    az login --tenant yourTenant.com    
-    ```
+az aks create \
+  --resource-group $RESOURCE_GROUP \
+  --name $CLUSTER_NAME \
+  --location $LOCATION \
+  --enable-managed-identity \
+  --node-count 3 \
+  --node-vm-size Standard_D4s_v4 \
+  --generate-ssh-keys \
+  --network-plugin azure \
+  --network-policy calico \
+  --enable-blob-driver \
+  --enable-workload-identity \
+  --enable-oidc-issuer
+```
 
-3. Create an azure resource group.
+**Important:** Use `--network-plugin azure` (not kubenet). Azure Application Gateway for Containers requires Azure CNI.
 
-    Replace `AZURE_RESOURCE_GROUP` with a group name you choose.
+Get cluster credentials:
 
-    ```bash
-    az group create --name AZURE_RESOURCE_GROUP --location eastus
-    ```
+```bash
+az aks get-credentials --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME --admin
+```
 
-4. Create a PostgreSQL database and create a related yaml file. 
+Verify cluster access:
 
-    1. Create the database in Azure
+```bash
+kubectl get nodes
+```
 
-        **Note: You must use a `flexible-server` because `single-server` does not included Postgres > 11.**
+### 4. Create PostgreSQL Database
 
-        - `POSTGRES_SERVER_NAME` : Replace with a name for your database
-        - `AZURE_RESOURCE_GROUP`: The same resource group you created above.
-        - `database-name`: The name of the database to be created when provisioning the database server. Leaving this as `mattermost` is probably best.
-        - `admin-user`: PostgreSQL admin user
-        - `admin-password`: password for the PostgreSQL admin user.
-        - `tier`: The [Azure database tier](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes) that has the `sku-name` needed.
-        - `sku-name`: The sku that has the resources you want in the tier you're in. You can find the descriptions on the above link under the `tier` you pick.
-        - `storage-size` : The storage capacity of the server. Minimum is 32 GiB and max is 16 TiB.  Default: 128.
-        - `version`: PostgreSQL version of the server.
-        - `public-access` : Determines the public access. Enter single or range of IP addresses to be included in the allowed list of IPs. IP address ranges must be dash-separated and not contain any spaces. Specifying 0.0.0.0 allows public access from any resources deployed within Azure to access your server. Setting it to "None" sets the server in public access mode but does not create a firewall rule. 
+Create a PostgreSQL Flexible Server:
 
-        ```bash
-        az postgres flexible-server create \
-            --name POSTGRES_SERVER_NAME \
-            --resource-group AZURE_RESOURCE_GROUP \
-            --database-name mattermost \
-            --location "East US" \
-            --admin-user mmuser \
-            --admin-password Testpassword123! \
-            --tier MemoryOptimized \
-            --sku-name Standard_E2ads_v5 \
-            --storage-size 128 \
-            --public-access 0.0.0.0 \
-            --version 14
-        ```
+```bash
+export POSTGRES_SERVER="mattermost-postgres"
+export POSTGRES_ADMIN_USER="mmadmin"
+export POSTGRES_ADMIN_PASSWORD="$(openssl rand -base64 32)"
 
-        **Example:**
+echo "PostgreSQL Admin Password: $POSTGRES_ADMIN_PASSWORD"  # Save this!
 
-        ```bash
-        > az postgres flexible-server create \ 
-            --name mattermost-postgres \ 
-            --resource-group myResourceGroup \     
-            --database-name mattermost \
-            --location "East US" \
-            --admin-user mmuser \
-            --admin-password Testpassword123! \
-            --tier MemoryOptimized \
-            --sku-name Standard_E2ads_v5 \
-            --storage-size 128 \
-            --public-access 0.0.0.0 \
-            --version 14
-        Checking the existence of the resource group 'myResourceGroup'...
-        Resource group 'myResourceGroup' exists ? : True 
-        Creating PostgreSQL Server 'mattermost-postgres' in group 'myResourceGroup'...
-        Your server 'mattermost-postgres' is using sku 'Standard_E2ads_v5' (Paid Tier). Please refer to https://aka.ms/postgres-pricing for pricing details
-        Configuring server firewall rule, 'azure-access', to accept connections from all Azure resources...
-        Creating PostgreSQL database 'mattermost'...
-        Make a note of your password. If you forget, you would have to reset your password with "az postgres flexible-server update -n mattermost-postgres -g myResourceGroup -p <new-password>".
-        Try using 'az postgres flexible-server connect' command to test out connection.
-        {
-            "connectionString": "postgresql://mmuser:Testpassword123!@mattermost-postgres.postgres.database.azure.com/mattermost?sslmode=require",
-            "databaseName": "mattermost",
-            "firewallName": "AllowAllAzureServicesAndResourcesWithinAzureIps_2023-11-3_12-13-50",
-            "host": "mattermost-postgres.postgres.database.azure.com",
-            "id": "/subscriptions/4c8a58d9-6291-4bcc-b7bd-4192a2d14fda/resourceGroups/myResourceGroup/providers/Microsoft.DBforPostgreSQL/flexibleServers/mattermost-postgres",
-            "location": "East US",
-            "password": "Testpassword123!",
-            "resourceGroup": "myResourceGroup",
-            "skuname": "Standard_E2ads_v5",
-            "username": "mmuser",
-            "version": "14"
-        }
-        ```
+az postgres flexible-server create \
+  --name $POSTGRES_SERVER \
+  --resource-group $RESOURCE_GROUP \
+  --location $LOCATION \
+  --admin-user $POSTGRES_ADMIN_USER \
+  --admin-password "$POSTGRES_ADMIN_PASSWORD" \
+  --sku-name Standard_E2ds_v4 \
+  --tier MemoryOptimized \
+  --storage-size 128 \
+  --version 18 \
+  --public-access 0.0.0.0
+```
 
-        **Take note of the `connectionString` value returned for later.**
+Create the Mattermost database:
 
-    2. Take the connectionString from step 1, and convert it to base64.
+```bash
+az postgres flexible-server db create \
+  --resource-group $RESOURCE_GROUP \
+  --server-name $POSTGRES_SERVER \
+  --database-name mattermost
+```
 
-        Note you need to switch `postgresql` from the string to `postgres` before converting.
+Create Kubernetes namespace:
 
-        ```bash
-        > echo -n 'postgres://mmuser:Testpassword123!@mattermost-postgres.postgres.database.azure.com/mattermost?sslmode=require' | base64
-        cG9zdGdyZXM6Ly9tbXVzZXI6VGVzdHBhc3N3b3JkMTIzIUBtYXR0ZXJtb3N0LXBvc3RncmVzLnBvc3RncmVzLmRhdGFiYXNlLmF6dXJlLmNvbS9tYXR0ZXJtb3N0P3NzbG1vZGU9cmVxdWlyZQ==
-        ```
+```bash
+kubectl create namespace mattermost
+```
 
-    3. Edit the `mattermost-secret-postgres.yaml` file and replace the  `POSTGRES_BASE64_CONNECTION_STRING` with the value from step 2.
+Create the PostgreSQL secret:
 
-        Both `DB_CONNECTION_CHECK_URL` and `DB_CONNECTION_STRING` should match.
+Edit [mattermost-postgres-secret.yaml](mattermost-postgres-secret.yaml) and replace the placeholders:
+- `YOUR_POSTGRES_USER` with `$POSTGRES_ADMIN_USER` (e.g., `mmadmin`)
+- `YOUR_POSTGRES_PASSWORD` with `$POSTGRES_ADMIN_PASSWORD`
+- `YOUR_POSTGRES_SERVER` with `$POSTGRES_SERVER` (e.g., `mattermost-postgres`)
 
-        It should now look like the below.
+Both `DB_CONNECTION_CHECK_URL` and `DB_CONNECTION_STRING` should have the same value:
+```
+postgres://mmadmin:YOUR_PASSWORD@mattermost-postgres.postgres.database.azure.com/mattermost?sslmode=require
+```
 
-        ```yaml
-        apiVersion: v1
-        data:
-            DB_CONNECTION_CHECK_URL: cG9zdGdyZXM6Ly9tbXVzZXI6VGVzdHBhc3N3b3JkMTIzIUBtYXR0ZXJtb3N0LXBvc3RncmVzLnBvc3RncmVzLmRhdGFiYXNlLmF6dXJlLmNvbS9tYXR0ZXJtb3N0P3NzbG1vZGU9cmVxdWlyZQ==
-            DB_CONNECTION_STRING: cG9zdGdyZXM6Ly9tbXVzZXI6VGVzdHBhc3N3b3JkMTIzIUBtYXR0ZXJtb3N0LXBvc3RncmVzLnBvc3RncmVzLmRhdGFiYXNlLmF6dXJlLmNvbS9tYXR0ZXJtb3N0P3NzbG1vZGU9cmVxdWlyZQ==
+Apply the secret:
+
+```bash
+kubectl apply -f mattermost-postgres-secret.yaml
+```
+
+Verify the secret was created:
+
+```bash
+kubectl get secret mattermost-postgres -n mattermost
+```
+
+### 5. Install cert-manager
+
+Install cert-manager for TLS certificate management:
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --version v1.19.2 \
+  --set crds.enabled=true
+```
+
+Wait for cert-manager:
+
+```bash
+kubectl wait --for=condition=ready pod \
+  -l app.kubernetes.io/instance=cert-manager \
+  -n cert-manager --timeout=300s
+```
+
+### 6. Install Azure Application Gateway for Containers
+
+Azure Application Gateway for Containers is a load balancer that implements the Kubernetes Gateway API. It provides ingress to the cluster and handles TLS termination for HTTPS traffic.
+
+Create managed identity:
+
+```bash
+az identity create \
+  --resource-group $RESOURCE_GROUP \
+  --name alb-controller-identity \
+  --location $LOCATION
+
+IDENTITY_PRINCIPAL_ID=$(az identity show \
+  --resource-group $RESOURCE_GROUP \
+  --name alb-controller-identity \
+  --query principalId -o tsv)
+
+IDENTITY_CLIENT_ID=$(az identity show \
+  --resource-group $RESOURCE_GROUP \
+  --name alb-controller-identity \
+  --query clientId -o tsv)
+```
+
+Assign permissions:
+
+```bash
+az role assignment create \
+  --assignee-object-id $IDENTITY_PRINCIPAL_ID \
+  --assignee-principal-type ServicePrincipal \
+  --scope "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RESOURCE_GROUP" \
+  --role "AppGw for Containers Configuration Manager"
+```
+
+Create federated identity credential:
+
+```bash
+AKS_OIDC_ISSUER=$(az aks show \
+  --resource-group $RESOURCE_GROUP \
+  --name $CLUSTER_NAME \
+  --query oidcIssuerProfile.issuerUrl -o tsv)
+
+az identity federated-credential create \
+  --name alb-controller-federated-credential \
+  --identity-name alb-controller-identity \
+  --resource-group $RESOURCE_GROUP \
+  --issuer "$AKS_OIDC_ISSUER" \
+  --subject system:serviceaccount:azure-alb-system:alb-controller-sa \
+  --audience api://AzureADTokenExchange
+```
+
+Install ALB Controller:
+
+```bash
+helm install alb-controller \
+  oci://mcr.microsoft.com/application-lb/charts/alb-controller \
+  --namespace azure-alb-system \
+  --create-namespace \
+  --set albController.namespace=azure-alb-system \
+  --set albController.podIdentity.clientID="$IDENTITY_CLIENT_ID"
+```
+
+Wait for ALB Controller:
+
+```bash
+kubectl wait --for=condition=ready pod \
+  -l app=alb-controller \
+  -n azure-alb-system --timeout=300s
+```
+
+### 7. Create Application Gateway for Containers
+
+```bash
+ALB_NAME="${CLUSTER_NAME}-alb"
+
+az network alb create \
+  --resource-group $RESOURCE_GROUP \
+  --name $ALB_NAME \
+  --location $LOCATION
+
+az network alb frontend create \
+  --resource-group $RESOURCE_GROUP \
+  --alb-name $ALB_NAME \
+  --name frontend-mattermost
+```
+
+Create association with AKS subnet:
+
+```bash
+NODE_RESOURCE_GROUP=$(az aks show \
+  --resource-group $RESOURCE_GROUP \
+  --name $CLUSTER_NAME \
+  --query nodeResourceGroup -o tsv)
+
+VNET_NAME=$(az network vnet list \
+  --resource-group $NODE_RESOURCE_GROUP \
+  --query "[0].name" -o tsv)
+
+SUBNET_ID=$(az network vnet subnet list \
+  --resource-group $NODE_RESOURCE_GROUP \
+  --vnet-name $VNET_NAME \
+  --query "[0].id" -o tsv)
+
+SUBNET_NAME=$(az network vnet subnet list \
+  --resource-group $NODE_RESOURCE_GROUP \
+  --vnet-name $VNET_NAME \
+  --query "[0].name" -o tsv)
+
+# Delegate the subnet to Traffic Controller
+az network vnet subnet update \
+  --resource-group $NODE_RESOURCE_GROUP \
+  --vnet-name $VNET_NAME \
+  --name $SUBNET_NAME \
+  --delegations Microsoft.ServiceNetworking/trafficControllers
+
+az network alb association create \
+  --resource-group $RESOURCE_GROUP \
+  --alb-name $ALB_NAME \
+  --name association-mattermost \
+  --subnet $SUBNET_ID
+```
+
+Get the ALB ID:
+
+```bash
+ALB_ID=$(az network alb show \
+  --resource-group $RESOURCE_GROUP \
+  --name $ALB_NAME \
+  --query id -o tsv)
+
+echo "ALB_ID: $ALB_ID"
+```
+
+### 8. Create Gateway API Resources
+
+Create GatewayClass:
+
+```bash
+kubectl apply -f gateway-class.yaml
+```
+
+Edit [cluster-issuer.yaml](cluster-issuer.yaml) and replace `YOUR_EMAIL` with your email address, then apply:
+
+```bash
+kubectl apply -f cluster-issuer.yaml
+```
+
+Edit [mattermost-gateway.yaml](mattermost-gateway.yaml) and replace `YOUR_ALB_ID` with your ALB ID (from step 7), then apply:
+
+```bash
+kubectl apply -f mattermost-gateway.yaml
+```
+
+**Note:** The Gateway will initially only have an HTTP listener. We'll add HTTPS after the TLS certificate is issued.
+
+Wait for Gateway to get an external IP:
+
+```bash
+kubectl wait --for=condition=Programmed gateway mattermost-gateway -n mattermost --timeout=300s
+
+GATEWAY_FQDN=$(kubectl get gateway mattermost-gateway -n mattermost -o jsonpath='{.status.addresses[0].value}')
+GATEWAY_IP=$(dig +short "$GATEWAY_FQDN" | head -1)
+
+echo "Gateway IP: $GATEWAY_IP"
+```
+
+**IMPORTANT:** Update your DNS to point your domain to the Gateway IP before continuing.
+
+### 9. Install MinIO Operator
+
+```bash
+kubectl apply -k "https://github.com/minio/operator?ref=v7.1.1"
+```
+
+Wait for operator:
+
+```bash
+kubectl wait --for=condition=ready pod \
+  -l name=minio-operator \
+  -n minio-operator --timeout=300s
+```
+
+### 10. Create MinIO Tenant
+
+Generate MinIO credentials:
+
+```bash
+export MINIO_ADMIN_USER="admin"
+export MINIO_ADMIN_PASSWORD="$(openssl rand -base64 32)"
+export MINIO_SERVICE_USER="mattermost"
+export MINIO_SERVICE_PASSWORD="$(openssl rand -base64 32)"
+
+echo "MinIO Admin: $MINIO_ADMIN_USER / $MINIO_ADMIN_PASSWORD"  # Save this!
+echo "MinIO Service: $MINIO_SERVICE_USER / $MINIO_SERVICE_PASSWORD"  # Save this!
+```
+
+Edit [minio-tenant-kustomize/tenant-credentials-secret.yaml](minio-tenant-kustomize/tenant-credentials-secret.yaml) and replace `YOUR_MINIO_ADMIN_USER` and `YOUR_MINIO_ADMIN_PASSWORD` with the admin credentials from above.
+
+Edit [minio-tenant-kustomize/mattermost-user-secret.yaml](minio-tenant-kustomize/mattermost-user-secret.yaml) and replace `YOUR_MINIO_SERVICE_USER` and `YOUR_MINIO_SERVICE_PASSWORD` with the service credentials from above.
+
+Deploy MinIO tenant and all resources:
+
+```bash
+kubectl apply -k minio-tenant-kustomize/
+```
+
+Wait for MinIO tenant:
+
+```bash
+kubectl wait --for=jsonpath='{.status.currentState}'=Initialized \
+  tenant/minio-mattermost \
+  -n mattermost-minio --timeout=600s
+```
+
+### 11. Configure MinIO Bucket
+
+Port-forward to MinIO:
+
+```bash
+kubectl port-forward svc/minio -n mattermost-minio 9000:80
+```
+
+Configure mc client:
+
+```bash
+mc alias set minio-local http://localhost:9000 $MINIO_ADMIN_USER $MINIO_ADMIN_PASSWORD
+```
+
+Create bucket and user:
+
+```bash
+# Create bucket
+mc mb minio-local/mattermost
+
+# Create service user
+mc admin user add minio-local $MINIO_SERVICE_USER $MINIO_SERVICE_PASSWORD
+
+# Create and apply policy (using existing minio-policy.json file)
+mc admin policy create minio-local mattermost-policy minio-policy.json
+mc admin policy attach minio-local mattermost-policy --user=$MINIO_SERVICE_USER
+```
+
+Stop port-forward:
+
+```bash
+pkill -f "kubectl port-forward svc/minio"
+```
+
+Create the Mattermost MinIO secret:
+
+Edit [mattermost-secret-minio.yaml](mattermost-secret-minio.yaml) and replace `YOUR_MINIO_SERVICE_USER` and `YOUR_MINIO_SERVICE_PASSWORD` with the service credentials from above.
+
+Apply the secret:
+
+```bash
+kubectl apply -f mattermost-secret-minio.yaml
+```
+
+### 12. Create TLS Certificate
+
+Edit [mattermost-certificate.yaml](mattermost-certificate.yaml) and replace `YOUR_DOMAIN` with your domain.
+
+Apply the certificate:
+
+```bash
+kubectl apply -f mattermost-certificate.yaml
+```
+
+Wait for the ACME solver service:
+
+```bash
+kubectl get svc -n mattermost -l acme.cert-manager.io/http01-solver=true -w
+```
+
+Once the solver service appears (press Ctrl+C to stop watching), get the solver service name:
+
+```bash
+kubectl get svc -n mattermost -l acme.cert-manager.io/http01-solver=true -o jsonpath='{.items[0].metadata.name}'
+```
+
+Edit [mattermost-acme-httproute.yaml](mattermost-acme-httproute.yaml) and replace `YOUR_DOMAIN` with your domain and `YOUR_SOLVER_SERVICE` with the solver service name from above.
+
+Apply the HTTPRoute:
+
+```bash
+kubectl apply -f mattermost-acme-httproute.yaml
+```
+
+Wait for certificate:
+
+```bash
+kubectl wait --for=condition=ready certificate mattermost-tls-cert -n mattermost --timeout=300s
+```
+
+Clean up ACME HTTPRoute:
+
+```bash
+kubectl delete httproute acme-challenge -n mattermost
+```
+
+### 13. Add HTTPS to Gateway
+
+Edit [mattermost-gateway.yaml](mattermost-gateway.yaml) and add the HTTPS listener to the `listeners` array:
+
+```yaml
+  - name: https-listener
+    protocol: HTTPS
+    port: 443
+    allowedRoutes:
+      namespaces:
+        from: Same
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: mattermost-tls-cert
         kind: Secret
-        metadata:
-            name: mattermost-postgres
-        type: Opaque
-        ```
+```
 
-    4. Save the file.
+Apply the updated Gateway:
 
-5. Create an AKS cluster.
+```bash
+kubectl apply -f mattermost-gateway.yaml
+```
 
-    - `AZURE_RESOURCE_GROUP` - The resource group you created above
-    - `AZURE_AKS_CLUSTER_NAME` - A name for your azure cluster. Something like `aks-mattermost` would work. 
+### 14. Install Mattermost Operator
 
-    ```bash
-    az aks create \
-        -g AZURE_RESOURCE_GROUP \
-        -n AZURE_AKS_CLUSTER_NAME \
-        --enable-managed-identity \
-        --node-count 3 \
-        --generate-ssh-keys \
-        --network-policy calico \
-        --network-plugin kubenet \
-        --enable-blob-driver
-    ```
+Add the Mattermost Helm repository:
 
-6. Install the AKS credentials to kubectl
+```bash
+helm repo add mattermost https://helm.mattermost.com
+```
 
-    Replace `myResourceGroup` and `myAKSCluster` with the group and name you created above.
+Create namespace:
 
-    ```bash
-    az aks get-credentials --resource-group AZURE_RESOURCE_GROUP --admin --name AZURE_AKS_CLUSTER_NAME
-    ```
+```bash
+kubectl create ns mattermost-operator
+```
 
-    **Example:**
-
-    ```bash
-    > az aks get-credentials --resource-group mattermost-reources --admin --name aks-mattermost
-    Merged "aks-mattermost-admin" as current context in /Users/test/.kube/config
-    >       
-    ```
-
-### Deploy the Mattermost Operator and NGINX
-
-1. Install the NGINX controller to the AKS cluster
+Install the operator:
 
-    ```bash
-    kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/cloud/deploy.yaml
-    ```
+```bash
+helm install mattermost-operator mattermost/mattermost-operator -n mattermost-operator
+```
 
-2. Confirm the nginx operator is running and has an external IP
-
-    ```bash
-    kubectl get service -n ingress-nginx
-    ```
-
-    Example:
+Wait for operator:
 
-    ```bash
-    > kubectl get service -n ingress-nginx 
-    NAME                                 TYPE           CLUSTER-IP     EXTERNAL-IP     PORT(S)                      AGE
-    ingress-nginx-controller             LoadBalancer   10.0.205.237   4.156.190.182   80:31900/TCP,443:32089/TCP   2m20s
-    ingress-nginx-controller-admission   ClusterIP      10.0.14.165    <none>          443/TCP                      2m20s
-    >           
-    ```
+```bash
+kubectl wait --for=condition=ready pod \
+  -l app.kubernetes.io/name=mattermost-operator \
+  -n mattermost-operator --timeout=300s
+```
 
-    Note: However you handle DNS, now is a good time to point your A record towards this external IP.
+### 15. Deploy Mattermost
 
-3. Install the Mattermost Operator
+Create a ClusterIP service for Gateway routing:
 
-    ```bash
-    kubectl create ns mattermost-operator
-    kubectl apply -n mattermost-operator -f https://raw.githubusercontent.com/mattermost/mattermost-operator/master/docs/mattermost-operator/mattermost-operator.yaml
-    ```
+```bash
+kubectl apply -f mattermost-gateway-svc.yaml
+```
 
-    Check that the operator pod is running with `kubectl get pod -n mattermost-operator`.
+Create the license secret:
 
-3. Create a namespace for mattermost services.
+First, base64 encode your license file:
 
-    This is not used yet, will be used for minio and mattermost later.
+```bash
+cat your-license.mattermost | base64
+```
 
-    ```bash
-    kubectl create namespace MATTERMOST_NAMESPACE
-    ```
+Edit [mattermost-secret-license.yaml](mattermost-secret-license.yaml) and replace `YOUR_BASE64_ENCODED_LICENSE` with the base64 output from above.
 
-    ```bash
-    > kubectl create namespace mattermost
-    namespace/mattermost created
-    ```
+Apply the secret:
 
-### Deploy the Minio Operator
+```bash
+kubectl apply -f mattermost-secret-license.yaml
+```
 
-This is an abridged version of the helm install guide - https://min.io/docs/minio/kubernetes/upstream/operations/install-deploy-manage/deploy-operator-helm.html
-For detailed questions, reference the guide.
+Edit [mattermost-httproute.yaml](mattermost-httproute.yaml) and replace `YOUR_DOMAIN` with your domain, then apply:
 
-1. Download the minio helm operator and tenant files locally.
+```bash
+kubectl apply -f mattermost-httproute.yaml
+```
 
-    ```bash
-    curl -O https://raw.githubusercontent.com/minio/operator/master/helm-releases/operator-5.0.10.tgz
-    curl -O https://raw.githubusercontent.com/minio/operator/master/helm-releases/tenant-5.0.10.tgz
-    ```
+Edit [mattermost-installation-minio.yaml](mattermost-installation-minio.yaml) and replace `YOUR_DOMAIN` with your domain, then apply:
 
-2. Deploy the minio operator
-
-    Note: You can modify the `--namespace minio-operator`, it could cause confusion in the future though. So, not recommended.
-
-    ```bash
-    helm install \
-        --namespace minio-operator \
-        --create-namespace \
-        minio-operator operator-5.0.10.tgz
-    ```
-
-    **Example**:
-
-    ```bash
-    > helm install \  
-        --namespace minio-operator \
-        --create-namespace \
-        minio-operator operator-5.0.10.tgz
-    NAME: minio-operator
-    LAST DEPLOYED: Fri Nov  3 12:54:29 2023
-    NAMESPACE: minio-operator
-    STATUS: deployed
-    REVISION: 1
-    TEST SUITE: None
-    NOTES:
-    1. Get the JWT for logging in to the console:
-    kubectl apply -f - <<EOF
-    apiVersion: v1
-    kind: Secret
-    metadata:
-    name: console-sa-secret
-    namespace: minio-operator
-    annotations:
-        kubernetes.io/service-account.name: console-sa
-    type: kubernetes.io/service-account-token
-    EOF
-    kubectl -n minio-operator  get secret console-sa-secret -o jsonpath="{.data.token}" | base64 --decode
-    ```
-
-3. Configure the operator
-
-    1. Create the service.yaml
-
-        Replace PORT_NUMBER with the port on which to serve the Operator GUI. Something like `30080` would be fine.
-        The range of valid ports is 30000-32767
-
-        ```bash
-        kubectl get service console -n minio-operator -o yaml > minio-service.yaml
-        yq e -i '.spec.type="ClusterIP"' minio-service.yaml
-        yq e -i '.spec.ports[0].nodePort = PORT_NUMBER' minio-service.yaml
-        ```
-
-    2. Create the operator.yaml file
-
-        ```bash
-        kubectl get deployment minio-operator -n minio-operator -o yaml > minio-operator.yaml
-        yq -i -e '.spec.replicas |= 1' minio-operator.yaml
-        ```
-
-4. Apply the new file changes to the minio operator
-
-    Note: the `minio-console-secret.yaml` file has already been created for you in this repo. Just copy it or use the exiting one. 
-
-    ```bash
-    kubectl apply -f minio-service.yaml
-    kubectl apply -f minio-operator.yaml
-    kubectl apply -f minio-console-secret.yaml
-    ```
-
-5. Confirm everything is running
-
-    ```bash
-    kubectl get all --namespace minio-operator   
-    ```
-
-    **Example:**
-
-    ```bash
-    > kubectl get all --namespace minio-operator        
-
-        NAME                                  READY   STATUS    RESTARTS   AGE
-    pod/console-7f8686864-wj56j           1/1     Running   0          2m29s
-    pod/minio-operator-5d77754785-mrgrn   1/1     Running   0          2m29s
-
-    NAME               TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)                         AGE
-    service/console    NodePort    10.0.157.180   <none>        9090:30080/TCP,9443:31270/TCP   2m29s
-    service/operator   ClusterIP   10.0.206.217   <none>        4221/TCP                        2m29s
-    service/sts        ClusterIP   10.0.165.240   <none>        4223/TCP                        2m29s
-
-    NAME                             READY   UP-TO-DATE   AVAILABLE   AGE
-    deployment.apps/console          1/1     1            1           2m29s
-    deployment.apps/minio-operator   1/1     1            1           2m29s
-
-    NAME                                        DESIRED   CURRENT   READY   AGE
-    replicaset.apps/console-7f8686864           1         1         1       2m29s
-    replicaset.apps/minio-operator-5d77754785   1         1         1       2m29s
-    ```
-
-6. (Optional) You can connect to the console via the UI and confirm it's up and running.
-
-    1. Get the JWT Token
-
-        ```bash
-        SA_TOKEN=$(kubectl -n minio-operator  get secret console-sa-secret -o jsonpath="{.data.token}" | base64 --decode)
-        echo $SA_TOKEN
-        ```
-
-    2. Forward the Operator console port to allow access
-
-        ```bash
-        kubectl --namespace minio-operator port-forward svc/console 9090:9090
-        ```
-
-    3. Access the console via `localhost:9090` and provide the JWT token.
-
-### Create the Minio Tenant and Mattermost Bucket
-
-**Make sure you have the minio plugin installed for kubectl. See prereqs for more details**.
-
-1. Create the tenant
-
-    Official Docs: https://min.io/docs/minio/kubernetes/upstream/operations/install-deploy-manage/deploy-minio-tenant.html#deploy-a-minio-tenant-using-the-command-line
-
-    [Docs on all these values](https://min.io/docs/minio/kubernetes/upstream/reference/kubectl-minio-plugin/kubectl-minio-tenant-create.html#kubectl.minio.tenant.create.-capacity)
-
-    - `--servers`: Number of minio servers to deploy. Cannot exceed the number of nodes in the kube cluster.
-    - `--capacity`: Total capacity of the tenant. This should match your azure blob max. 
-    - `--volumes` : Number of volumes per server, mounted as separate drives. 
-    - `--storage-class`: Should match the same storage class defined in your azure blob.
-    - `TENANT_NAME` - The name for your Minio tenant for Mattermost. I use `minio-mattermost`
-    - `--disable-tls` - This allows minio and Mattermost to communicate over `http` on the local ports. We are not exposing minio to any external traffic.
-    - `--namespace` - This is the namespace you created for Mattermost services. 
+```bash
+kubectl apply -f mattermost-installation-minio.yaml
+```
 
-    ```bash
-    kubectl minio tenant create  \
-        TENANT_NAME \
-        --disable-tls \
-        --capacity 200Gi \
-        --servers 2 \
-        --volumes 4 \
-        --namespace MATTERMOST_NAMESPACE \
-        --storage-class azureblob-nfs-premium
-    ```
-
-    Note: Copy / store the credentials that it outputs. If you ever lose these, they can be found again in the minio operator console.
-    Note 2: You need to use a `nfs-premium` storage class or you will run into issues with multi-volume instances.
-
-    **Example**:
-
-    ```bash
-    > kubectl minio tenant create  \                                                                                                                                                    node system at kube aks-mattermost-admin
-        minio-mattermost \
-        --disable-tls \
-        --capacity 200Gi \
-        --servers 2 \
-        --volumes 4 \
-        --namespace mattermost \          
-        --storage-class azureblob-nfs-premium
-    W1103 13:07:45.459691   53687 warnings.go:70] unknown field "spec.pools[0].volumeClaimTemplate.metadata.creationTimestamp"
-
-    Tenant 'minio-mattermost' created in 'mattermost' Namespace
-
-    Username: EJ3Y0K7EF062AYNS317A 
-    Password: VodEt4LDDUnzbcWJA7BKTrp4EFeu6EC37KTe0Rsp 
-    Note: Copy the credentials to a secure location. MinIO will not display these again.
-
-    APPLICATION     SERVICE NAME                    NAMESPACE       SERVICE TYPE    SERVICE PORT 
-    MinIO           minio                           mattermost      ClusterIP       80          
-    Console         minio-mattermost-console        mattermost      ClusterIP       9090        
-    > 
-    ```
+Wait for Mattermost:
 
-3. Forward local port `9000` into the minio service on port `80`
-
-    ```bash
-    kubectl -n MATTERMOST_NAMESPACE port-forward svc/minio 9000:80
-    ```
+```bash
+kubectl wait --for=condition=ready pod \
+  -l app=mattermost \
+  -n mattermost --timeout=600s
+```
 
-    **Example:** 
+### 16. Verify Deployment
 
-    ```bash
-    > kubectl -n mattermost port-forward svc/minio 9000:80
-    Forwarding from 127.0.0.1:9000 -> 9000
-    Forwarding from [::1]:9000 -> 9000
-    ```
+Check Mattermost status:
 
-4. Create the `mc` connection to your minio pod, create the bucket, and add a service account.
+```bash
+kubectl get mattermost -n mattermost
+```
 
-    - `TENANT_NAME` - Same tenant name as above.
-    - `MINIO_TENANT_USERNAME` - The username that was output at step 1 when creating the tenant
-    - `MINIO_TENANT_PASSWORD` - The password that was output at step 1 when creating the tenant.
+Test HTTPS access:
 
-    ```bash
-    mc config host add TENANT_NAME http://localhost:9000 MINIO_TENANT_USERNAME MINIO_TENANT_PASSWORD
-    mc mb TENANT_NAME/mattermost
-    mc admin user add TENANT_NAME SERVICE_USERNAME SERVICE_PASSWORD
-    ```
+```bash
+curl -s https://$DOMAIN/api/v4/system/ping
+```
 
-    **Example:**
+You should see: `{"status":"OK",...}`
 
-    ```bash
-    > mc config host add minio-mattermost http://localhost:9000 EJ3Y0K7EF062AYNS317A VodEt4LDDUnzbcWJA7BKTrp4EFeu6EC37KTe0Rsp
-    Added `minio-mattermost` successfully.
+## Accessing Mattermost
 
-    > mc mb minio-mattermost/mattermost 
-    Bucket created successfully `minio-mattermost/mattermost`.
-    
-    > mc admin user add minio-mattermost mattermost SuperSecretPassword123!
-    Added user `mattermost` successfully.
-    ```
+Navigate to `https://your-domain.com` in your browser to access Mattermost and complete the initial setup.
 
-5. Convert the service username and password to a base 64 value to be used in step 6.
+## Common Operations
 
-    ```bash
-    echo -n 'SERVICE_USERNAME' | base64
-    echo -n 'SERVICE_PASSWORD' | base64
-    ```
+### View Logs
 
-    **Example:**
+```bash
+kubectl logs -n mattermost -l app=mattermost -f
+```
 
-    ```bash
-    > echo -n 'mattermost' | base64
-    bWF0dGVybW9zdA==
+### Restart Mattermost
 
-    > echo -n 'SuperSecretPassword123!' | base64
-    VGVzdFBhc3N3b3JkMTIzIQ==
-    ```
+```bash
+kubectl rollout restart deployment -n mattermost -l app=mattermost
+```
 
-6. Edit the `mattermost-secret-minio.yaml` file and replace `SERVICE_USERNAME` and `SERVICE_PASSWORD` with the above values.
+### Check Gateway Status
 
-    It should look roughly like this when done.
+```bash
+kubectl get gateway mattermost-gateway -n mattermost
+kubectl describe gateway mattermost-gateway -n mattermost
+```
 
-    ```yaml
-    apiVersion: v1
-    data:
-        accesskey: bWF0dGVybW9zdA==
-        secretkey: U3VwZXJTZWNyZXRQYXNzd29yZDEyMyE=
-    kind: Secret
-    metadata:
-        name: mattermost-secret-minio
-    type: Opaque
-    ```
+### Check Certificate Status
 
-7. Create a policy for the `SERVICE_USERNAME` account.
+```bash
+kubectl get certificate -n mattermost
+kubectl describe certificate mattermost-tls-cert -n mattermost
+```
 
-    1. Modify the `minio-policy.json` file IF NEEDED and replace `mattermost` with your bucket name.
+## Troubleshooting
 
-    2. Add the policy to minio via mc
+### Gateway Not Getting IP
 
-        ```bash
-        mc admin policy create TENANT_NAME mattermost-policy ./minio-policy.json 
-        ```
+Check ALB Controller logs:
 
-        **Example:**
+```bash
+kubectl logs -n azure-alb-system -l app=alb-controller
+```
 
-        ```bash
-        > mc admin policy create minio-mattermost mattermost-policy ./minio-policy.json
-        Created policy `mattermost-policy` successfully.
-        ```
+### Certificate Not Issuing
 
-    3. Assign the policy to your `SERVICE_USERNAME`
+Check challenges:
 
-        ```bash
-        mc admin policy set TENANT_NAME mattermost-policy --user=SERVICE_USERNAME
-        ```
+```bash
+kubectl get challenges -A
+kubectl describe challenge <challenge-name> -n mattermost
+```
 
-        **Example:**
+Make sure you created the temporary HTTPRoute for the ACME solver.
 
-        ```bash
-        > mc admin policy set minio-mattermost mattermost-policy --user=mattermost
-        Created policy `mattermost-policy` successfully.
-        ```
-### Deploy the Mattermost Service
+### MinIO Tenant Not Healthy
 
-1. Update the `mattermost-secret-license.yaml` file with your license key.
+Check PVCs:
 
-    Replace `LICENSE_STRING` with the output from your mattermost license file.
+```bash
+kubectl get pvc -n mattermost-minio
+```
 
-2. Update the `mattermost-install.yaml` file with the values relevant to your deployment.
+They should use `azureblob-nfs-premium` storage class.
 
-    The file itself has descriptions on every relevant value. If you've not deviated from this deployment, you may not have to update anything.
+### Mattermost Pods Not Starting
 
-3. Apply the config file
+Check pod logs:
 
-    Note: `-n MATTERMOST_NAMESPACE` - This is the namespace you created above.
-
-    ```bash
-    kubectl apply -n MATTERMOST_NAMESPACE -f mattermost-secret-postgres.yaml
-    kubectl apply -n MATTERMOST_NAMESPACE -f mattermost-secret-minio.yaml
-    kubectl apply -n MATTERMOST_NAMESPACE -f mattermost-secret-license.yaml
-    kubectl apply -n MATTERMOST_NAMESPACE -f mattermost-installation.yaml
-    ```
-
-4. Monitor until complete. This process takes 2-3 minutes.
-
-    Note: `-n mattermost` - This is the namespace you created above.
-
-    ```bash
-    kubectl -n mattermost get mm -w
-    ```
-
-    If you need to debug anything you can use the below commands. Usually the error is in the operator events/logs or the mattermost pods. 
-
-    **Common Commands**
-
-    - `kubectl get pods -A` - Returns a list of the existing pods. You'll see `mattermost-service` pods that are bring create. 
-    - `kubectl logs -n [namespace] [pod]` - View logs for a specific namespace / pod
-    - `kubectl events -n [namespace] [pod]`-  view events for a specific namespace / pod
-
-5. Access your Mattermost install via the domain name and confirm all is working.
-
-    - If your domain is not up yet you can port forward to it. 
+```bash
+kubectl get pods -n mattermost
+kubectl logs <pod-name> -n mattermost
+```
