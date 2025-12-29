@@ -105,6 +105,16 @@ kubectl get nodes
 ### 4. Create PostgreSQL Database
 
 Create a PostgreSQL Flexible Server:
+**Note: You must use a `flexible-server` because `single-server` does not include Postgres > 11.**
+
+- `database-name`: The name of the database to be created when provisioning the database server. Leaving this as `mattermost` is probably best.
+- `admin-user`: PostgreSQL admin user
+- `admin-password`: password for the PostgreSQL admin user.
+- `tier`: The [Azure database tier](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes) that has the `sku-name` needed.
+- `sku-name`: The sku that has the resources you want in the tier you're in. You can find the descriptions on the above link under the `tier` you pick.
+- `storage-size` : The storage capacity of the server. Minimum is 32 GiB and max is 16 TiB.  Default: 128.
+- `version`: PostgreSQL version of the server.
+- `public-access` : Determines the public access. Enter single or range of IP addresses to be included in the allowed list of IPs. IP address ranges must be dash-separated and not contain any spaces. Specifying 0.0.0.0 allows public access from any resources deployed within Azure to access your server. Setting it to "None" sets the server in public access mode but does not create a firewall rule.
 
 ```bash
 export POSTGRES_SERVER="mattermost-postgres"
