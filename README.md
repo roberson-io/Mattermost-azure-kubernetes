@@ -14,6 +14,7 @@ This guide **does not** show you how to properly lock down your Azure tenant or 
 - **Azure CLI** - For managing Azure resources
 - **helm** - Kubernetes package manager
 - **mc** - MinIO client for bucket configuration
+- **pwgen** - Password generator for secrets
 
 ### Installing Tools
 
@@ -31,6 +32,9 @@ brew install helm
 
 # Install MinIO client
 brew install minio/stable/mc
+
+# Install pwgen
+brew install pwgen
 ```
 
 **Linux/Windows:**
@@ -38,6 +42,8 @@ brew install minio/stable/mc
 - kubectl: https://kubernetes.io/docs/tasks/tools/
 - helm: https://helm.sh/docs/intro/install/
 - mc: https://min.io/docs/minio/linux/reference/minio-mc.html
+- pwgen: https://sourceforge.net/projects/pwgen/
+
 
 ## Deployment Steps
 
