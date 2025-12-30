@@ -125,7 +125,7 @@ Create a PostgreSQL Flexible Server:
 ```bash
 export POSTGRES_SERVER="mattermost-postgres"
 export POSTGRES_ADMIN_USER="mmadmin"
-export POSTGRES_ADMIN_PASSWORD="$(openssl rand -base64 32 | tr -d '+/=' | head -c 32)"
+export POSTGRES_ADMIN_PASSWORD="$(pwgen -s 32 1)"
 
 echo "PostgreSQL Admin Password: $POSTGRES_ADMIN_PASSWORD"  # Save this!
 
@@ -391,9 +391,9 @@ Generate MinIO credentials:
 
 ```bash
 export MINIO_ADMIN_USER="admin"
-export MINIO_ADMIN_PASSWORD="$(openssl rand -base64 32)"
+export MINIO_ADMIN_PASSWORD="$(pwgen -s 32 1)"
 export MINIO_SERVICE_USER="mattermost"
-export MINIO_SERVICE_PASSWORD="$(openssl rand -base64 32)"
+export MINIO_SERVICE_PASSWORD="$(pwgen -s 32 1)"
 
 echo "MinIO Admin: $MINIO_ADMIN_USER / $MINIO_ADMIN_PASSWORD"  # Save this!
 echo "MinIO Service: $MINIO_SERVICE_USER / $MINIO_SERVICE_PASSWORD"  # Save this!
